@@ -11,7 +11,7 @@
 
 ## Estructura del pipeline:
 
-- Programación: el DAG de airflow se implementará para ejectuar una vez al día antes del inicio de la jornada laboral. 
+- Programación: el DAG de airflow se implementará para ejecutar una vez al día antes del inicio de la jornada laboral. 
   - Programado, por ejemplo, diario a las 6 am. 
 - El pipeline procesará archivos con una ventana de 7 días (current_date – 7 días, current_date), 
   - Esto permite capturar archivos con retraso
@@ -21,7 +21,7 @@
   - Lectura de archivos desde S3
   - Identificación de archivos por fecha (metadata o convención de nombre si el contexto lo permite)
   - Registro de archivos procesados en processed_files.
-  - Operaciòn COPY directa de S3 a tabla staging en Redshift.
+  - Operación COPY directa de S3 a tabla staging en Redshift.
 - Transformación: en esta etapa 
   - Se validarán y definirán el tipo de los campos
   - Se estandarizarán los campos que apliquen (status)
@@ -43,7 +43,7 @@
 ## Estrategia de carga
 
 - Incremental
-  - Debido al crecimiento de volumen, sería costose e innecesario reprocesar y cargar el histórico de la data
+  - Debido al crecimiento de volumen, sería costoso e innecesario reprocesar y cargar el histórico de la data
   - Con estrategia de merge se actualizan registros necesarios
 - Se utilizará tabla intermedia staging para:
   - Validación de datos
@@ -79,27 +79,63 @@
 
 # Parte 2
 
-- Si un archivo no llega un día: el pipeline propuesto tendría una falla controlada, levantando una alerta con notificación de que no se encontraron archivos a procesar, para tomar a acción si es necesario o contactar al usuario responsable.
-
-Si el archivo llega al día siguiente (o en los días siguientes) una ejecución posterior lo procesará y tendrá el mismo comportamiento de merge a la tabla final.
+- Si un archivo no llega un día: No lo trataría necesariamente como fallo técnico del pipeline, sino como evento operativo esperado. El DAG terminaría en estado controlado, registraría no_data_found y enviaría alerta si se supera el SLA esperado. Si el archivo llega al día siguiente (o en los días siguientes) una ejecución posterior lo procesará y tendrá el mismo comportamiento de merge a la tabla final.
 
 - Si un archivo llega 2 veces con contenido diferente: el pipeline al inicio calculará el hash del archivo (huella digital) y consultará  la tabla processed_files para validar si el archivo ya fue procesado, en este caso lo encontrará pero al validar las hash_keys se tomará como una corrección y se reprocesará, utilizando la estrategia de merge para incluir las correcciones.
 
-- Si un archivo llega con una columna adicional: el pipeline incluye detección en cambios de esquema y lo lanza como alerta. Sin embargo lo acepta de forma flexible, implementando un tipo de dato super para extrafields que lo guarde temporalmente mientras se decide si es un campo importante, como para llevarlo a la tabla final e implementar manualmente los cambios.
+- Si un archivo llega con una columna adicional: Ante columnas nuevas, el pipeline detectaría drift de esquema y generaría una alerta. Si el campo no es requerido para la tabla final, podría almacenarse temporalmente como metadata o en una columna extra_fields tipo SUPER mientras se evalúa su incorporación formal al modelo.
 
-- Si el volumen crece 10x: Para esto se propuso en el pipeline la eextracción de datos mediante operación COPY, eficiente desde S3 a Redshift. También en la tabla final de Redshift se creará una Sort Key y Dist Key que permitirá hacer un merge más eficiente.
+- Si el volumen crece 10x: Para esto se propuso en el pipeline la extracción de datos mediante operación COPY, eficiente desde S3 a Redshift. También en la tabla final de Redshift se creará una Sort Key y Dist Key que permitirá hacer un merge más eficiente.
 
-- Si el dashboard muestra números distintos a los del sistema transaccional: inicialmente sería identificar en segmento de datos que presenta diferencias (rango de fechas, moneda específica, estado), cual es la magnitud de la diferencia y qué métrica la presenta. Posteriormente una comparación por capas (fuente vs staging, staging vs tabla final, tabla gfinal vs dashboard), que permitiría identificar en qué etapa se presenta la malformación de la data. Con esto se pueden encontrar las causas de la diferencia, que pueden ser por duplicados, diferencia en lógica de negocio dashboard vs sistema transaccional, datos tardìos como se menciona en el enunciado, etc. Finalmente dependiendo de los hallazgos anteriores, se procederìa con el ajuste acorde (queries, merge o upsert, entre otras posibilidades)
+- Si el dashboard muestra números distintos a los del sistema transaccional: inicialmente sería identificar en segmento de datos que presenta diferencias (rango de fechas, moneda específica, estado), cual es la magnitud de la diferencia y qué métrica la presenta. Posteriormente una comparación por capas (fuente vs staging, staging vs tabla final, tabla final vs dashboard), que permitiría identificar en qué etapa se presenta la alteración de la data. Con esto se pueden encontrar las causas de la diferencia, que pueden ser por duplicados, diferencia en lógica de negocio dashboard vs sistema transaccional, datos tardíos como se menciona en el enunciado, etc. Finalmente dependiendo de los hallazgos anteriores, se procedería con el ajuste acorde (queries, merge o upsert, entre otras posibilidades)
 
 # Parte 3
 
-´
+```SQL
+CREATE TABLE fact_sales (
+    order_id      VARCHAR(100) PRIMARY KEY,
+    user_id       VARCHAR(100) NOT NULL,
+    amount        DECIMAL(18,2) NOT NULL,
+    currency      VARCHAR(10) NOT NULL,
+    status        VARCHAR(50) NOT NULL,
+    created_at    TIMESTAMP NOT NULL,
+    updated_at    TIMESTAMP NOT NULL,
+    source_file   VARCHAR(500) NOT NULL,
+    loaded_at     TIMESTAMP DEFAULT GETDATE()
+)
+DISTKEY(order_id)
+SORTKEY(created_at);
+```
 
-- Como clave primaria se escoge order_id, asumiendo un valor único por cada registro, que permitirá estrategia de upsert y eliminación de duplicados
+- Como clave primaria y clave lógica de negocio se escoge order_id, asumiendo un valor único por cada registro, que permitirá estrategia de upsert y eliminación de duplicados
 - Como sort key se eligió el campo created_at, ya que sería el principal filtro y dimensión de muchas queries analíticas. Además, el pipeline de ingesta reprocesa por ventanas de tiempo, esta sort key resultaría en menos operaciones de lectura, o sea, más eficiencia.
 - Finalmente, al estar almacenados en un ambiente distribuido durante las operaciones de merge, sería más eficiente que la data fuera distribuida de forma ordenada en los diferentes nodos de datos. Es por esto que la dist key es el campo order_id.
 
-- Con este query se encuentran los order_id que aparezcan en más de 1 registro, identificando duplicados. Después de esto se podría añadir la mínima y máxima fecha de modificación para analizar el comportamiento. Y con window functions dar prioridad al registro más nuevo.
+## Identificaicón de duplicados
+
+```SQL
+SELECT
+    order_id,
+    COUNT(*) AS records_count
+FROM fact_sales
+GROUP BY order_id
+HAVING COUNT(*) > 1
+ORDER BY records_count DESC;
+```
+
+## Total ventas y número de órdenes por día y moneda
+
+```SQL
+SELECT
+    DATE_TRUNC('day', created_at) AS sales_date,
+    currency,
+    SUM(amount) AS total_sales,
+    COUNT(*) AS total_orders
+FROM fact_sales
+WHERE status = 'completed'
+GROUP BY 1, 2
+ORDER BY 1, 2;
+```
 
 # Parte 4
 
